@@ -76,6 +76,7 @@ def load_latent_checkpoint(
 
         # -- loading encoder
         pretrained_dict = checkpoint['encoder']
+        pretrained_dict = {k.replace("module.", ""): v for k, v in pretrained_dict.items()}
         msg = encoder.load_state_dict(pretrained_dict)
         logger.info(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
 
@@ -84,7 +85,7 @@ def load_latent_checkpoint(
         logger.info(f'Encountered exception when loading checkpoint {e}')
         epoch = 0
 
-    return encoder, epoch
+    return encoder
 
 
 def init_model(

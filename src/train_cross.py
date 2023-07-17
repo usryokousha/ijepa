@@ -48,7 +48,7 @@ from src.helper import (
     load_latent_checkpoint,
     init_cross_model,
     init_opt)
-from src.transforms import make_transforms
+from src.transforms import CrossTransform
 
 # --
 log_timings = True
@@ -182,7 +182,7 @@ def main(args, resume_preempt=False):
     latent_encoder = load_latent_checkpoint(
         device=device,
         r_path=latent_load_path,
-        latent_encoder=latent_encoder)
+        encoder=latent_encoder)
 
     # -- make data transforms
     mask_collator = MBMaskCollator(
@@ -196,13 +196,16 @@ def main(args, resume_preempt=False):
         allow_overlap=allow_overlap,
         min_keep=min_keep)
 
-    transform = make_transforms(
+    transform = CrossTransform(
         crop_size=crop_size,
         crop_scale=crop_scale,
+        latent_crop_size=latent_crop_size,
+        latent_crop_scale=latent_crop_scale,
         gaussian_blur=use_gaussian_blur,
         horizontal_flip=use_horizontal_flip,
         color_distortion=use_color_distortion,
-        color_jitter=color_jitter)
+        color_jitter=color_jitter,
+    )
 
     # -- init data-loaders/samplers
     _, unsupervised_loader, unsupervised_sampler = make_imagenet1k(
@@ -237,7 +240,10 @@ def main(args, resume_preempt=False):
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=True)
     target_encoder = DistributedDataParallel(target_encoder)
+    latent_encoder = DistributedDataParallel(latent_encoder)
     for p in target_encoder.parameters():
+        p.requires_grad = False
+    for p in latent_encoder.parameters():
         p.requires_grad = False
 
     # -- momentum schedule
@@ -295,8 +301,8 @@ def main(args, resume_preempt=False):
 
             def load_imgs():
                 # -- unsupervised imgs
-                imgs = udata[0].to(device, non_blocking=True)
-                hd_imgs = udata[1].to(device, non_blocking=True)
+                imgs = udata[0][0].to(device, non_blocking=True)
+                hd_imgs = udata[0][1].to(device, non_blocking=True)
                 masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
                 masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
                 return (imgs, hd_imgs, masks_1, masks_2)

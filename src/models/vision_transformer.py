@@ -19,6 +19,7 @@ from src.utils.tensors import (
     repeat_interleave_batch
 )
 from src.masks.utils import apply_masks
+from typing import Optional
 
 try:
     from xformers.ops import memory_efficient_attention, unbind, fmha
@@ -34,6 +35,7 @@ class Attention(nn.Module):
         dim: int,
         num_heads: int = 8,
         qkv_bias: bool = False,
+        qk_scale: Optional[float] = None,
         proj_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
@@ -41,7 +43,7 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
+        self.scale = qk_scale or head_dim**-0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -52,8 +54,8 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
-        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
-        attn = q @ k.transpose(-2, -1)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
 
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -61,7 +63,7 @@ class Attention(nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+        return x, attn
 
 class EfficientAttention(Attention):
     """Memory Efficient Self Attention Module"""
@@ -69,11 +71,11 @@ class EfficientAttention(Attention):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = unbind(qkv, dim=0)
-        attn = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+        attn = memory_efficient_attention(q, k, v, attn_bias=attn_bias, scale=self.scale)
         x = attn.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+        return x, attn
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
@@ -158,7 +160,7 @@ class DropPath(nn.Module):
         self.drop_prob = drop_prob
 
     def forward(self, x):
-        return drop_path(x, self.drop_prob, self.training) if self.drop_prob else x
+        return drop_path(x, self.drop_prob, self.training) 
 
 
 class MLP(nn.Module):
