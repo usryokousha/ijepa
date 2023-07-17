@@ -101,7 +101,7 @@ class DropPath(nn.Module):
         self.drop_prob = drop_prob
 
     def forward(self, x):
-        return drop_path(x, self.drop_prob, self.training)
+        return drop_path(x, self.drop_prob, self.training) if self.drop_prob else x
 
 
 class MLP(nn.Module):
@@ -210,7 +210,7 @@ class ConvEmbed(nn.Module):
 
         # Comptute the number of patches
         stride_prod = int(np.prod(strides))
-        self.num_patches = (img_size[0] // stride_prod)**2
+        self.num_patches = (img_size // stride_prod)**2 # Assume square images
 
     def forward(self, x):
         p = self.stem(x)
@@ -266,8 +266,8 @@ class VisionTransformerPredictor(nn.Module):
             param.div_(math.sqrt(2.0 * layer_id))
 
         for layer_id, layer in enumerate(self.predictor_blocks):
-            rescale(layer.attn.proj.weight.data, layer_id + 1)
-            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
+            rescale(layer.attn.proj.weight.data, layer_id + 1) # pyright: ignore
+            rescale(layer.mlp.fc2.weight.data, layer_id + 1) # pyright: ignore
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -382,8 +382,8 @@ class VisionTransformer(nn.Module):
             param.div_(math.sqrt(2.0 * layer_id))
 
         for layer_id, layer in enumerate(self.blocks):
-            rescale(layer.attn.proj.weight.data, layer_id + 1)
-            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
+            rescale(layer.attn.proj.weight.data, layer_id + 1) # pyright: ignore
+            rescale(layer.mlp.fc2.weight.data, layer_id + 1) # pyright: ignore
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -443,50 +443,49 @@ class VisionTransformer(nn.Module):
 
 def vit_predictor(**kwargs):
     model = VisionTransformerPredictor(
-        mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        **kwargs)
+        mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
     return model
 
 
 def vit_tiny(patch_size=16, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
     return model
 
 
 def vit_small(patch_size=16, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
     return model
 
 
 def vit_base(patch_size=16, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
     return model
 
 
 def vit_large(patch_size=16, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
     return model
 
 
 def vit_huge(patch_size=16, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=1280, depth=32, num_heads=16, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
     return model
 
 
 def vit_giant(patch_size=16, **kwargs):
     model = VisionTransformer(
         patch_size=patch_size, embed_dim=1408, depth=40, num_heads=16, mlp_ratio=48/11,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
     return model
 
 
