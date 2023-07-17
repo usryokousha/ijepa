@@ -11,6 +11,7 @@ import sys
 import torch
 
 import src.models.vision_transformer as vit
+import src.models.cross_modal_predictor as cmp
 from src.utils.schedulers import (
     WarmupCosineSchedule,
     CosineWDSchedule)
@@ -65,6 +66,27 @@ def load_checkpoint(
     return encoder, predictor, target_encoder, opt, scaler, epoch
 
 
+def load_latent_checkpoint(
+    device,
+    r_path,
+    encoder):
+    try:
+        checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
+        epoch = checkpoint['epoch']
+
+        # -- loading encoder
+        pretrained_dict = checkpoint['encoder']
+        msg = encoder.load_state_dict(pretrained_dict)
+        logger.info(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
+
+
+    except Exception as e:
+        logger.info(f'Encountered exception when loading checkpoint {e}')
+        epoch = 0
+
+    return encoder, epoch
+
+
 def init_model(
     device,
     patch_size=16,
@@ -104,6 +126,56 @@ def init_model(
     return encoder, predictor
 
 
+def init_cross_model(
+    device,
+    patch_size=16,
+    latent_patch_size=16,
+    model_name='vit_base',
+    latent_model_name='vit_base',
+    crop_size=96,
+    latent_crop_size=224,
+    pred_depth=6,
+    pred_emb_dim=384,
+):
+    encoder = vit.__dict__[model_name](
+        img_size=[crop_size],
+        patch_size=patch_size)
+
+    latent_encoder = vit.__dict__[latent_model_name](
+        img_size=[latent_crop_size],
+        patch_size=latent_patch_size)
+
+    predictor = cmp.__dict__['cross_modal_predictor'](
+        num_patches=encoder.patch_embed.num_patches,
+        latent_num_patches=latent_encoder.patch_embed.num_patches,
+        embed_dim=encoder.embed_dim,
+        latent_embed_dim=latent_encoder.embed_dim,
+        predictor_embed_dim=pred_emb_dim,
+        depth=pred_depth,
+        num_heads=encoder.num_heads)
+
+    def init_weights(m):
+        if isinstance(m, torch.nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+        elif isinstance(m, torch.nn.LayerNorm):
+            torch.nn.init.constant_(m.bias, 0)
+            torch.nn.init.constant_(m.weight, 1.0)
+
+    for m in encoder.modules():
+        init_weights(m)
+
+    for m in predictor.modules():
+        init_weights(m)
+
+    encoder.to(device)
+    predictor.to(device)
+    latent_encoder.to(device)
+    logger.info(encoder)
+    return encoder, latent_encoder, predictor
+
+    
 def init_opt(
     encoder,
     predictor,

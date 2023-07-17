@@ -4,11 +4,18 @@ import torch
 from torch import Tensor
 from torch import nn
 import warnings
+from functools import partial
 
-from vision_transformer import DropPath, get_2d_sincos_pos_embed
+from vision_transformer import (
+                                Attention as SelfAttention,
+                                EfficientAttention as EfficientSelfAttention,
+                                DropPath, 
+                                get_2d_sincos_pos_embed
+                                )
+
 from ..utils.tensors import apply_masks, trunc_normal_, repeat_interleave_batch
 
-from typing import List, Union
+from typing import List, Union, Optional
 
 
 try:
@@ -19,46 +26,12 @@ except ImportError:
     warnings.warn("xFormers not available")
     XFORMERS_AVAILABLE = False
 
-class SelfAttention(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        qkv_bias: bool = False,
-        proj_bias: bool = True,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim**-0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim, bias=proj_bias)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x: Tensor) -> Tensor:
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-
-        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
-        attn = q @ k.transpose(-2, -1)
-
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
 class CrossAttention(nn.Module):
     """Cross Attention Module"""
     def __init__(
         self,
         dim: int,
+        kv_dim: Optional[int] = None,
         num_heads: int = 8,
         qkv_bias: bool = False,
         proj_bias: bool = True,
@@ -70,8 +43,11 @@ class CrossAttention(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
 
+        if kv_dim is None:
+            kv_dim = dim
+            
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.kv = nn.Linear(kv_dim, dim * 2, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -98,22 +74,10 @@ class EfficientCrossAttention(CrossAttention):
         B, N, C = x.shape
         q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         kv = self.kv(context).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        k, v = kv.unbind(dim=0)
+        k, v = unbind(kv, dim=0)
 
         attn = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
 
-        x = attn.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-    
-class EfficientSelfAttention(SelfAttention):
-    """Memory Efficient Self Attention Module"""
-    def forward(self, x: Tensor, attn_bias=None) -> Tensor:
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = unbind(qkv, dim=0)
-        attn = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
         x = attn.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -150,13 +114,13 @@ class DecoderBlock(nn.Module):
                  drop_path=0., 
                  act_layer=nn.GELU, 
                  norm_layer=nn.LayerNorm,
-                 self_attn=SelfAttention, 
-                 cross_attn=CrossAttention):
+                 self_attn_class=SelfAttention, 
+                 cross_attn_class=CrossAttention):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.self_attn = self_attn(dim, num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.self_attn = self_attn_class(dim, num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.norm2 = norm_layer(dim)
-        self.cross_attn = cross_attn(dim, num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.cross_attn = cross_attn_class(dim, num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm3 = norm_layer(dim)
         self.mlp = MLP(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
@@ -171,8 +135,10 @@ class CrossModalPredictor(nn.Module):
     """Transformer Decoder Predictor for Cross Modal I-JEPA"""
 
     def __init__(self,
-                 num_patches, 
+                 num_patches,
+                 latent_num_patches, 
                  embed_dim,
+                 latent_embed_dim,
                  predictor_embed_dim, 
                  num_heads=12,
                  depth=6, 
@@ -184,17 +150,19 @@ class CrossModalPredictor(nn.Module):
                  init_std=0.02, 
                  act_layer=nn.GELU, 
                  norm_layer=nn.LayerNorm,
-                 self_attn=SelfAttention,
-                 cross_attn=CrossAttention):
+                 self_attn_class=SelfAttention,
+                 cross_attn_class=CrossAttention):
         super().__init__()
         # input embedding
         self.num_patches = num_patches
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
+        self.latent_embed = nn.Linear(latent_embed_dim, predictor_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         # build blocks
         self.predictor_pos_embed = nn.Parameter(torch.zeros(1, num_patches, predictor_embed_dim),
                                                 requires_grad=False)
+        self.latent_pos_embed = nn.Parameter(torch.zeros(1, latent_num_patches, predictor_embed_dim))
         predictor_pos_embed = get_2d_sincos_pos_embed(self.predictor_pos_embed.shape[-1],
                                                       int(num_patches**.5),
                                                       cls_token=False)
@@ -209,8 +177,8 @@ class CrossModalPredictor(nn.Module):
                          drop_path=dpr[i], 
                          act_layer=act_layer, 
                          norm_layer=norm_layer,
-                         self_attn=self_attn,
-                         cross_attn=cross_attn)
+                         self_attn_class=self_attn_class,
+                         cross_attn_class=cross_attn_class)
             for i in range(depth)])
         self.predictor_norm = norm_layer(predictor_embed_dim)
         self.predictor_proj = nn.Linear(predictor_embed_dim, embed_dim, bias=True)
@@ -275,17 +243,39 @@ class CrossModalPredictor(nn.Module):
 
         return x, N_ctxt
 
+    def prepare_latent(self, latent):
+        # -- map from latent-dim to pedictor-dim
+        latent = self.latent_embed(latent)
+
+        # -- add positional embedding to latent tokens
+        latent_pos_embed = self.latent_pos_embed.repeat(latent.size(0), 1, 1)
+        latent += latent_pos_embed
+
+        return latent
+
     def forward(self, 
                 x: Tensor, 
-                context: Tensor,
+                latent: Tensor,
                 masks: Union[Tensor, List[Tensor]], 
                 mask_indices: Union[Tensor, List[Tensor]]) -> Tensor:
         x, N_ctxt = self.prepare_inputs(x, masks, mask_indices)
+        latent = self.prepare_latent(latent)
+
         for layer in self.predictor_blocks:
-            x = layer(x, context)
+            x = layer(x, latent)
+
         x = self.predictor_norm(x)
         # -- return preds for mask tokens
         x = x[:, N_ctxt:]
         x = self.predictor_proj(x)
 
         return x
+
+def cross_modal_predictor(**kwargs):
+    model = CrossModalPredictor(
+        mlp_ratio=4, 
+        qkv_bias=True, 
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        attn_class=EfficientSelfAttention,
+        **kwargs) # pyright: ignore
+    return model

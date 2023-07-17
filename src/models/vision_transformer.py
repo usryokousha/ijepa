@@ -6,17 +6,74 @@
 #
 
 import math
+import warnings
 from functools import partial
 import numpy as np
 
 import torch
 import torch.nn as nn
+from torch import Tensor
 
 from src.utils.tensors import (
     trunc_normal_,
     repeat_interleave_batch
 )
 from src.masks.utils import apply_masks
+
+try:
+    from xformers.ops import memory_efficient_attention, unbind, fmha
+
+    XFORMERS_AVAILABLE = True
+except ImportError:
+    warnings.warn("xFormers not available")
+    XFORMERS_AVAILABLE = False
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim**-0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+
+        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
+        attn = q @ k.transpose(-2, -1)
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class EfficientAttention(Attention):
+    """Memory Efficient Self Attention Module"""
+    def forward(self, x: Tensor, attn_bias=None) -> Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = unbind(qkv, dim=0)
+        attn = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+        x = attn.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
@@ -123,39 +180,12 @@ class MLP(nn.Module):
         return x
 
 
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x, attn
-
-
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, attn_class=Attention):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(
+        self.attn = attn_class(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -233,6 +263,7 @@ class VisionTransformerPredictor(nn.Module):
         attn_drop_rate=0.0,
         drop_path_rate=0.0,
         norm_layer=nn.LayerNorm,
+        attn_class=Attention,
         init_std=0.02,
         **kwargs
     ):
@@ -251,7 +282,7 @@ class VisionTransformerPredictor(nn.Module):
         self.predictor_blocks = nn.ModuleList([
             Block(
                 dim=predictor_embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, attn_class=attn_class)
             for i in range(depth)])
         self.predictor_norm = norm_layer(predictor_embed_dim)
         self.predictor_proj = nn.Linear(predictor_embed_dim, embed_dim, bias=True)
@@ -345,6 +376,7 @@ class VisionTransformer(nn.Module):
         attn_drop_rate=0.0,
         drop_path_rate=0.0,
         norm_layer=nn.LayerNorm,
+        attn_class=Attention,
         init_std=0.02,
         **kwargs
     ):
@@ -369,7 +401,7 @@ class VisionTransformer(nn.Module):
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, attn_class=attn_class)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
         # ------
@@ -443,49 +475,95 @@ class VisionTransformer(nn.Module):
 
 def vit_predictor(**kwargs):
     model = VisionTransformerPredictor(
-        mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
+        mlp_ratio=4, 
+        qkv_bias=True, 
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        attn_class=EfficientAttention,
+        **kwargs) # pyright: ignore
     return model
 
 
 def vit_tiny(patch_size=16, **kwargs):
     model = VisionTransformer(
-        patch_size=patch_size, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
+        patch_size=patch_size, 
+        embed_dim=192, 
+        depth=12, 
+        num_heads=3, 
+        mlp_ratio=4,
+        qkv_bias=True, 
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        attn_class=EfficientAttention, 
+        **kwargs) # pyright: ignore
     return model
 
 
 def vit_small(patch_size=16, **kwargs):
     model = VisionTransformer(
-        patch_size=patch_size, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
+        patch_size=patch_size, 
+        embed_dim=384, 
+        depth=12, 
+        num_heads=6, 
+        mlp_ratio=4,
+        qkv_bias=True, 
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        attn_class=EfficientAttention, 
+        **kwargs) # pyright: ignore
     return model
 
 
 def vit_base(patch_size=16, **kwargs):
     model = VisionTransformer(
-        patch_size=patch_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
+        patch_size=patch_size, 
+        embed_dim=768, 
+        depth=12, 
+        num_heads=12, 
+        mlp_ratio=4,
+        qkv_bias=True, 
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        attn_class=EfficientAttention, 
+        **kwargs) # pyright: ignore
     return model
 
 
 def vit_large(patch_size=16, **kwargs):
     model = VisionTransformer(
-        patch_size=patch_size, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
+        patch_size=patch_size, 
+        embed_dim=1024, 
+        depth=24, 
+        num_heads=16, 
+        mlp_ratio=4,
+        qkv_bias=True, 
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        attn_class=EfficientAttention, 
+        **kwargs) # pyright: ignore
     return model
 
 
 def vit_huge(patch_size=16, **kwargs):
     model = VisionTransformer(
-        patch_size=patch_size, embed_dim=1280, depth=32, num_heads=16, mlp_ratio=4,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
+        patch_size=patch_size, 
+        embed_dim=1280, 
+        depth=32, 
+        num_heads=16, 
+        mlp_ratio=4,
+        qkv_bias=True, 
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        attn_class=EfficientAttention, 
+        **kwargs) # pyright: ignore
     return model
 
 
 def vit_giant(patch_size=16, **kwargs):
     model = VisionTransformer(
-        patch_size=patch_size, embed_dim=1408, depth=40, num_heads=16, mlp_ratio=48/11,
-        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs) # pyright: ignore
+        patch_size=patch_size, 
+        embed_dim=1408, 
+        depth=40, 
+        num_heads=16, 
+        mlp_ratio=48/11,
+        qkv_bias=True, 
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        attn_class=EfficientAttention, 
+        **kwargs) # pyright: ignore
     return model
 
 
